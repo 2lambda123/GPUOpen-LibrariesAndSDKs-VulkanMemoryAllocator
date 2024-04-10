@@ -8698,8 +8698,11 @@ private:
 
         void MarkFree() { prevFree = VMA_NULL; }
         void MarkTaken() { prevFree = this; }
-        bool IsFree() const { return prevFree != this; }
-        void*& UserData() { VMA_HEAVY_ASSERT(!IsFree()); return userData; }
+        void MarkMargin() { prevFree = reinterpret_cast<Block*>(UINTPTR_MAX); }
+        bool IsFree() const { return !IsTaken() && !IsMargin(); }
+        bool IsTaken() const { return prevFree == this; }
+        bool IsMargin() const { return prevFree == reinterpret_cast<Block*>(UINTPTR_MAX); }
+        void*& UserData() { VMA_HEAVY_ASSERT(IsTaken()); return userData; }
         Block*& PrevFree() { return prevFree; }
         Block*& NextFree() { VMA_HEAVY_ASSERT(IsFree()); return nextFree; }
 
@@ -8864,8 +8867,7 @@ bool VmaBlockMetadata_TLSF::Validate() const
         }
         else
         {
-            ++allocCount;
-            // Check if taken block is not on a free list
+            // Check if taken or margin block is not on a free list
             Block* freeBlock = m_FreeList[listIndex];
             while (freeBlock)
             {
@@ -8873,9 +8875,22 @@ bool VmaBlockMetadata_TLSF::Validate() const
                 freeBlock = freeBlock->NextFree();
             }
 
-            if (!IsVirtual())
+            if (prev->IsMargin())
             {
-                VMA_VALIDATE(m_GranularityHandler.Validate(validateCtx, prev->offset, prev->size));
+                // Margin block belongs to free block category,
+                // but is not granted seat on the free list
+                ++freeCount;
+                calculatedFreeSize += prev->size;
+                VMA_VALIDATE(prev->prevPhysical != VMA_NULL);
+                VMA_VALIDATE(prev->prevPhysical->IsTaken());
+            }
+            else
+            {
+                ++allocCount;
+                if (!IsVirtual())
+                {
+                    VMA_VALIDATE(m_GranularityHandler.Validate(validateCtx, prev->offset, prev->size));
+                }
             }
         }
 
@@ -8908,10 +8923,10 @@ void VmaBlockMetadata_TLSF::AddDetailedStatistics(VmaDetailedStatistics& inoutSt
 
     for (Block* block = m_NullBlock->prevPhysical; block != VMA_NULL; block = block->prevPhysical)
     {
-        if (block->IsFree())
-            VmaAddDetailedStatisticsUnusedRange(inoutStats, block->size);
-        else
+        if (block->IsTaken())
             VmaAddDetailedStatisticsAllocation(inoutStats, block->size);
+        else
+            VmaAddDetailedStatisticsUnusedRange(inoutStats, block->size);
     }
 }
 
@@ -8949,10 +8964,10 @@ void VmaBlockMetadata_TLSF::PrintDetailedMap(class VmaJsonWriter& json) const
     for (; i < blockCount; ++i)
     {
         Block* block = blockList[i];
-        if (block->IsFree())
-            PrintDetailedMap_UnusedRange(json, block->offset, block->size);
-        else
+        if (block->IsTaken())
             PrintDetailedMap_Allocation(json, block->offset, block->size, block->UserData());
+        else
+            PrintDetailedMap_UnusedRange(json, block->offset, block->size);
     }
     if (m_NullBlock->size > 0)
         PrintDetailedMap_UnusedRange(json, m_NullBlock->offset, m_NullBlock->size);
@@ -9127,7 +9142,7 @@ VkResult VmaBlockMetadata_TLSF::CheckCorruption(const void* pBlockData)
 {
     for (Block* block = m_NullBlock->prevPhysical; block != VMA_NULL; block = block->prevPhysical)
     {
-        if (!block->IsFree())
+        if (block->IsTaken())
         {
             if (!VmaValidateMagicValue(pBlockData, block->offset + block->size))
             {
@@ -9156,7 +9171,6 @@ void VmaBlockMetadata_TLSF::Alloc(
     if (currentBlock != m_NullBlock)
         RemoveFreeBlock(currentBlock);
 
-    VkDeviceSize debugMargin = GetDebugMargin();
     VkDeviceSize misssingAlignment = offset - currentBlock->offset;
 
     // Append missing alignment to prev block or create new one
@@ -9165,7 +9179,7 @@ void VmaBlockMetadata_TLSF::Alloc(
         Block* prevBlock = currentBlock->prevPhysical;
         VMA_ASSERT(prevBlock != VMA_NULL && "There should be no missing alignment at offset 0!");
 
-        if (prevBlock->IsFree() && prevBlock->size != debugMargin)
+        if (prevBlock->IsFree())
         {
             uint32_t oldList = GetListIndex(prevBlock->size);
             prevBlock->size += misssingAlignment;
@@ -9198,6 +9212,7 @@ void VmaBlockMetadata_TLSF::Alloc(
         currentBlock->offset += misssingAlignment;
     }
 
+    VkDeviceSize debugMargin = GetDebugMargin();
     VkDeviceSize size = request.size + debugMargin;
     if (currentBlock->size == size)
     {
@@ -9254,10 +9269,13 @@ void VmaBlockMetadata_TLSF::Alloc(
         newBlock->offset = currentBlock->offset + currentBlock->size;
         newBlock->prevPhysical = currentBlock;
         newBlock->nextPhysical = currentBlock->nextPhysical;
-        newBlock->MarkTaken();
+        newBlock->MarkMargin();
         currentBlock->nextPhysical->prevPhysical = newBlock;
         currentBlock->nextPhysical = newBlock;
-        InsertFreeBlock(newBlock);
+        // Count margin block into stats, but don't place it on free list
+        // as it will never be selected for allocation
+        ++m_BlocksFreeCount;
+        m_BlocksFreeSize += debugMargin;
     }
 
     if (!IsVirtual())
@@ -9270,7 +9288,7 @@ void VmaBlockMetadata_TLSF::Free(VmaAllocHandle allocHandle)
 {
     Block* block = (Block*)allocHandle;
     Block* next = block->nextPhysical;
-    VMA_ASSERT(!block->IsFree() && "Block is already free!");
+    VMA_ASSERT(block->IsTaken() && "Block is already free or margin!");
 
     if (!IsVirtual())
         m_GranularityHandler.FreePages(block->offset, block->size);
@@ -9279,7 +9297,10 @@ void VmaBlockMetadata_TLSF::Free(VmaAllocHandle allocHandle)
     VkDeviceSize debugMargin = GetDebugMargin();
     if (debugMargin > 0)
     {
-        RemoveFreeBlock(next);
+        VMA_ASSERT(next->size == debugMargin);
+        // Adjust stats for one less block
+        --m_BlocksFreeCount;
+        m_BlocksFreeSize -= debugMargin;
         MergeBlock(next, block);
         block = next;
         next = next->nextPhysical;
@@ -9308,7 +9329,7 @@ void VmaBlockMetadata_TLSF::Free(VmaAllocHandle allocHandle)
 void VmaBlockMetadata_TLSF::GetAllocationInfo(VmaAllocHandle allocHandle, VmaVirtualAllocationInfo& outInfo)
 {
     Block* block = (Block*)allocHandle;
-    VMA_ASSERT(!block->IsFree() && "Cannot get allocation info for free block!");
+    VMA_ASSERT(block->IsTaken() && "Cannot get allocation info for not taken block!");
     outInfo.offset = block->offset;
     outInfo.size = block->size;
     outInfo.pUserData = block->UserData();
@@ -9317,7 +9338,7 @@ void VmaBlockMetadata_TLSF::GetAllocationInfo(VmaAllocHandle allocHandle, VmaVir
 void* VmaBlockMetadata_TLSF::GetAllocationUserData(VmaAllocHandle allocHandle) const
 {
     Block* block = (Block*)allocHandle;
-    VMA_ASSERT(!block->IsFree() && "Cannot get user data for free block!");
+    VMA_ASSERT(block->IsTaken() && "Cannot get user data for not taken block!");
     return block->UserData();
 }
 
@@ -9328,7 +9349,7 @@ VmaAllocHandle VmaBlockMetadata_TLSF::GetAllocationListBegin() const
 
     for (Block* block = m_NullBlock->prevPhysical; block; block = block->prevPhysical)
     {
-        if (!block->IsFree())
+        if (block->IsTaken())
             return (VmaAllocHandle)block;
     }
     VMA_ASSERT(false && "If m_AllocCount > 0 then should find any allocation!");
@@ -9338,11 +9359,11 @@ VmaAllocHandle VmaBlockMetadata_TLSF::GetAllocationListBegin() const
 VmaAllocHandle VmaBlockMetadata_TLSF::GetNextAllocation(VmaAllocHandle prevAlloc) const
 {
     Block* startBlock = (Block*)prevAlloc;
-    VMA_ASSERT(!startBlock->IsFree() && "Incorrect block!");
+    VMA_ASSERT(startBlock->IsTaken() && "Incorrect block!");
 
     for (Block* block = startBlock->prevPhysical; block; block = block->prevPhysical)
     {
-        if (!block->IsFree())
+        if (block->IsTaken())
             return (VmaAllocHandle)block;
     }
     return VK_NULL_HANDLE;
@@ -9351,7 +9372,7 @@ VmaAllocHandle VmaBlockMetadata_TLSF::GetNextAllocation(VmaAllocHandle prevAlloc
 VkDeviceSize VmaBlockMetadata_TLSF::GetNextFreeRegionSize(VmaAllocHandle alloc) const
 {
     Block* block = (Block*)alloc;
-    VMA_ASSERT(!block->IsFree() && "Incorrect block!");
+    VMA_ASSERT(block->IsTaken() && "Incorrect block!");
 
     if (block->prevPhysical)
         return block->prevPhysical->IsFree() ? block->prevPhysical->size : 0;
@@ -9382,14 +9403,14 @@ void VmaBlockMetadata_TLSF::Clear()
 void VmaBlockMetadata_TLSF::SetAllocationUserData(VmaAllocHandle allocHandle, void* userData)
 {
     Block* block = (Block*)allocHandle;
-    VMA_ASSERT(!block->IsFree() && "Trying to set user data for not allocated block!");
+    VMA_ASSERT(block->IsTaken() && "Trying to set user data for not allocated block!");
     block->UserData() = userData;
 }
 
 void VmaBlockMetadata_TLSF::DebugLogAllAllocations() const
 {
     for (Block* block = m_NullBlock->prevPhysical; block != VMA_NULL; block = block->prevPhysical)
-        if (!block->IsFree())
+        if (block->IsTaken())
             DebugLogAllocation(block->offset, block->size, block->UserData());
 }
 
